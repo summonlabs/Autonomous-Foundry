@@ -176,6 +176,8 @@ class FoundryCore::Impl {
   /// Move a candidate to Evaluated when every declared requirement has a
   /// complete authoritative-capable record, and settle its attempt.
   void settle_candidate_locked(CandidateRecord& candidate);
+  /// Keep a prepared decision for inspection without replacing a committed one.
+  void store_prepared_selection_locked(const SelectionDecision& decision);
 
   // -- dispatch helpers (lock held) ----------------------------------------
 

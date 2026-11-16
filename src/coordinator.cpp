@@ -1236,9 +1236,10 @@ void FoundryCoordinator::Impl::dispatch_ready_workers() {
 void FoundryCoordinator::Impl::begin_dispatch(const std::uint64_t connection_id,
                                               const WorkerRecord& worker,
                                               FoundryCore& core_state) {
-  if (worker.state != WorkerState::Ready) {
-    // A worker that is Busy, Draining, Offline or awaiting revalidation is not
-    // a dispatch target, and the core would refuse it anyway.
+  const bool resume = worker.state == WorkerState::Busy && worker.active_attempt.valid();
+  if (worker.state != WorkerState::Ready && !resume) {
+    // A worker that is Draining, Offline or awaiting revalidation is not a
+    // dispatch target, and the core would refuse it anyway.
     return;
   }
   // Authorize, persist, confirm and send as one indivisible step with respect
@@ -1253,11 +1254,24 @@ void FoundryCoordinator::Impl::begin_dispatch(const std::uint64_t connection_id,
   // authorize_attempt creates the attempt durably in Authorized state and
   // reserves its budgets. Unavailable and NotReady are ordinary answers - no
   // population is running, no slot is free - and the next tick tries again.
-  const Result<PendingDispatch> pending = core_state.authorize_attempt(session);
-  if (!pending.ok()) {
-    return;
+  AttemptRecord attempt;
+  if (resume) {
+    // An attempt is Authorized outside this function only when the snapshot
+    // that records it could not be written. It is still unsent, its worker is
+    // Busy and nothing else would ever move it, so its dispatch is finished
+    // here: persist, confirm, send.
+    const Result<AttemptRecord> open = core_state.attempt(worker.active_attempt);
+    if (!open.ok() || open.value().state != AttemptState::Authorized) {
+      return;
+    }
+    attempt = open.value();
+  } else {
+    const Result<PendingDispatch> pending = core_state.authorize_attempt(session);
+    if (!pending.ok()) {
+      return;
+    }
+    attempt = pending.value().attempt;
   }
-  const AttemptRecord& attempt = pending.value().attempt;
   bool sent = false;
   {
     // mutate -> persist -> notify. The Authorized attempt is on disk BEFORE the
@@ -1266,8 +1280,8 @@ void FoundryCoordinator::Impl::begin_dispatch(const std::uint64_t connection_id,
     // explain instead of authority a worker is already acting on.
     const Status saved = persist(core_state);
     if (!saved.ok()) {
-      // The attempt stays Authorized and unsent: the next tick re-authorizes
-      // from the same durable evidence rather than inventing a dispatch.
+      // The attempt stays Authorized and unsent: the next tick finishes this
+      // dispatch rather than inventing one.
       return;
     }
     const Result<AttemptPackage> package =
@@ -1793,6 +1807,12 @@ Status FoundryCoordinator::shutdown(std::string reason) {
   // 4. A final verified snapshot. save_and_verify proves the image reloads to an
   //    equal state instead of assuming it does.
   if (core_) {
+    // Connections are still open here, so a frame or a disconnect can be
+    // changing and persisting state on its own thread. The final write and the
+    // reload that verifies it take the same barrier as every other writer;
+    // without it the verification can read the file while another snapshot is
+    // replacing it.
+    const std::unique_lock<std::recursive_mutex> durability(impl_->durability_mutex);
     const Status saved = impl_->persist_final(*core_);
     if (!saved.ok()) {
       outcome = saved.with_context("the final snapshot could not be written and verified");

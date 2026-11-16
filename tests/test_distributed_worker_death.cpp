@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "autonomous_foundry/candidate.hpp"
+#include "autonomous_foundry/coordinator.hpp"
 #include "autonomous_foundry/error.hpp"
 #include "autonomous_foundry/foundry.hpp"
 #include "autonomous_foundry/id.hpp"
@@ -539,4 +540,127 @@ AF_TEST_CASE(distributed_worker_death,
   EXPECT_FALSE(af_ctx, process_is_alive(restarted.pid()));
   EXPECT_FALSE(af_ctx, process_is_alive(worker.pid()));
   worker.close();
+}
+
+// ---------------------------------------------------------------------------
+// A dispatch whose snapshot could not be written is finished, not abandoned
+// ---------------------------------------------------------------------------
+
+AF_TEST_CASE(distributed_worker_death,
+             authorized_attempt_is_dispatched_once_its_snapshot_can_be_written) {
+  af_ctx.phase("SETUP");
+  af_test::TempDirectory workdir("af-dispatch-resume");
+  const std::filesystem::path state_directory = workdir.child("state");
+  const std::filesystem::path parked_directory = workdir.child("state-parked");
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(state_directory, filesystem_error);
+  AF_DIST_REQUIRE(af_ctx, !filesystem_error, "the state directory could not be created");
+
+  CoordinatorConfig config;
+  config.endpoint.host = "127.0.0.1";
+  config.endpoint.port = 0;
+  config.state_path = state_directory / "coordinator.state";
+  config.workspace_root = workdir.child("workspace");
+  config.evaluation_concurrency = 1;
+  config.fresh_start = true;
+  FoundryCoordinator coordinator(config);
+  REQUIRE_OK(af_ctx, coordinator.start());
+
+  Endpoint endpoint;
+  endpoint.host = "127.0.0.1";
+  endpoint.port = coordinator.port();
+
+  ProtocolClient controller;
+  REQUIRE_OK(af_ctx, controller.connect(endpoint));
+  AF_DIST_REQUIRE_OK(af_ctx, controller.hello(af_ctx, SessionRole::Controller, WorkerId(),
+                                              WorkerBootId(), "distributed-tests", "controller"));
+  const FoundryPolicy policy =
+      make_reference_policy(placeholder_policy_id(0x31u), PolicyGeneration::first());
+  Result<PolicyDefinedMessage> defined = define_policy(af_ctx, controller, policy);
+  AF_DIST_REQUIRE_OK(af_ctx, defined);
+  Result<TaskSpec> task =
+      reference_task(0x31u, defined.value().policy, defined.value().generation, 2u);
+  AF_DIST_REQUIRE_OK(af_ctx, task);
+  Result<TaskCreatedMessage> created = create_task(af_ctx, controller, task.value());
+  AF_DIST_REQUIRE_OK(af_ctx, created);
+  PopulationSpec spec;
+  spec.name = "P1";
+  spec.task = created.value().task;
+  spec.task_generation = created.value().generation;
+  spec.policy = defined.value().policy;
+  spec.policy_generation = defined.value().generation;
+  spec.candidate_budget = 2u;
+  spec.worker_budget = 1u;
+  spec.population_index = 1u;
+  Result<PopulationCreatedMessage> population = create_population(af_ctx, controller, spec);
+  AF_DIST_REQUIRE_OK(af_ctx, population);
+  Result<PopulationStateMessage> started = start_population(
+      af_ctx, controller,
+      population_binding(population.value().population, population.value().generation,
+                         created.value().task, created.value().generation,
+                         defined.value().policy, defined.value().generation));
+  AF_DIST_REQUIRE_OK(af_ctx, started);
+
+  const WorkerId worker_id = worker_identity(0x31u, 1u);
+  const WorkerBootId worker_boot = boot_identity(0x31u, 1u);
+  ProtocolClient worker;
+  REQUIRE_OK(af_ctx, worker.connect(endpoint));
+  Result<HelloAckMessage> worker_ack =
+      worker.hello(af_ctx, SessionRole::Worker, worker_id, worker_boot, "worker-resume", "reference");
+  AF_DIST_REQUIRE_OK(af_ctx, worker_ack);
+  const WorkerSessionAuthority session = worker_session(worker_ack.value(), worker_id, worker_boot);
+
+  af_ctx.phase("DISPATCH");
+  // From here every snapshot write fails: the directory that holds it is gone.
+  std::filesystem::rename(state_directory, parked_directory, filesystem_error);
+  AF_DIST_REQUIRE(af_ctx, !filesystem_error, "the state directory could not be parked");
+
+  // The worker becomes Ready, and the snapshot of that cannot be written.
+  const Result<ControlAckMessage> ready = worker_ready(af_ctx, worker, session, "reference");
+  EXPECT_FALSE(af_ctx, ready.ok());
+
+  // The pump authorizes an attempt for the Ready worker and cannot persist it,
+  // so nothing may leave the process yet.
+  await_true(af_ctx, "WAIT", [&] {
+    return coordinator.core().statistics().attempts_authorized == 1u;
+  });
+  const std::vector<AttemptRecord> unsent = coordinator.core().attempts();
+  EXPECT_EQ(af_ctx, unsent.size(), static_cast<std::size_t>(1));
+  if (!unsent.empty()) {
+    EXPECT_EQ(af_ctx, unsent.front().state, AttemptState::Authorized);
+  }
+
+  // Storage is back. The attempt that was authorized meanwhile is the one that
+  // is dispatched: it is neither stranded nor replaced by another attempt.
+  std::filesystem::rename(parked_directory, state_directory, filesystem_error);
+  AF_DIST_REQUIRE(af_ctx, !filesystem_error, "the state directory could not be restored");
+
+  af_ctx.phase("WAIT");
+  HeartbeatMessage heartbeat;
+  heartbeat.session = session;
+  heartbeat.sequence = 1;
+  Result<std::string> heartbeat_payload = encode_payload(heartbeat);
+  AF_DIST_REQUIRE_OK(af_ctx, heartbeat_payload);
+  Result<Frame> assignment = worker.exchange(af_ctx, MessageType::Heartbeat,
+                                             heartbeat_payload.value(),
+                                             {MessageType::AssignAttempt});
+  AF_DIST_REQUIRE_OK(af_ctx, assignment);
+
+  af_ctx.phase("VERIFY");
+  Result<AssignAttemptMessage> assigned = decode_assign_attempt(assignment.value().payload);
+  AF_DIST_REQUIRE_OK(af_ctx, assigned);
+  const std::vector<AttemptRecord> dispatched = coordinator.core().attempts();
+  EXPECT_EQ(af_ctx, dispatched.size(), static_cast<std::size_t>(1));
+  if (!dispatched.empty() && !unsent.empty()) {
+    EXPECT_EQ(af_ctx, dispatched.front().id, unsent.front().id);
+    EXPECT_EQ(af_ctx, assigned.value().package.attempt, unsent.front().id);
+    EXPECT_EQ(af_ctx, dispatched.front().state, AttemptState::Dispatched);
+  }
+  EXPECT_EQ(af_ctx, coordinator.core().statistics().attempts_authorized,
+            static_cast<std::uint64_t>(1));
+
+  af_ctx.phase("SHUTDOWN");
+  worker.close();
+  controller.close();
+  EXPECT_OK(af_ctx, coordinator.shutdown("dispatch resume proof complete"));
 }

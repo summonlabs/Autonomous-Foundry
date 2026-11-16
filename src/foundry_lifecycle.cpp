@@ -408,6 +408,14 @@ Status FoundryCore::cancel_population(PopulationId id, PopulationGeneration gene
                       std::string(population_state_name(population->state)));
   }
   AF_TRY(check_population_generation(generation, population->generation));
+  // Refused before anything changes: cancelling the attempts of a population
+  // that then cannot become Cancelled would leave it running without them.
+  if (!population_transition_is_legal(population->state, PopulationState::Cancelled)) {
+    return Status(ErrorCode::IllegalStateTransition,
+                  "population " + id.to_string() + " is " +
+                      std::string(population_state_name(population->state)) +
+                      " and cannot be cancelled");
+  }
 
   for (auto& entry : impl_->attempts_) {
     AttemptRecord& attempt = entry.second;

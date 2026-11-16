@@ -375,6 +375,7 @@ void FoundryCore::Impl::settle_candidate_locked(CandidateRecord& candidate) {
         attempt.state == AttemptState::Running || attempt.state == AttemptState::Dispatched) {
       set_attempt_state_locked(attempt, AttemptState::Completed,
                                "candidate reached Evaluated");
+      ++statistics_.attempts_completed;
       if (!attempt.holds_reservation) {
         continue;
       }

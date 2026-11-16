@@ -2422,10 +2422,13 @@ bool snapshots_are_equal(const FoundrySnapshot& a, const FoundrySnapshot& b) {
       a.promotion_requests != b.promotion_requests) {
     return false;
   }
+  if (a.ledgers.size() != b.ledgers.size()) {
+    return false;
+  }
   for (const auto& entry : a.ledgers) {
-    const BudgetLedger& other = b.ledgers.at(entry.first);
-    if (!(entry.second.limits() == other.limits()) ||
-        !(entry.second.counters() == other.counters())) {
+    const auto other = b.ledgers.find(entry.first);
+    if (other == b.ledgers.end() || !(entry.second.limits() == other->second.limits()) ||
+        !(entry.second.counters() == other->second.counters())) {
       return false;
     }
   }

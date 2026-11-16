@@ -1158,3 +1158,238 @@ AF_TEST_CASE(adversarial, artifact_names_cannot_escape_the_workspace) {
     EXPECT_FALSE(af_ctx, candidate.artifact_set_digest.empty());
   }
 }
+
+// ---------------------------------------------------------------------------
+// Refused transitions leave no trace; terminal populations decide nothing
+// ---------------------------------------------------------------------------
+
+AF_TEST_CASE(adversarial, refused_selection_commit_leaves_no_trace) {
+  af_ctx.phase("SETUP");
+  af_test::FoundryFixture fixture(af_test::make_config(61));
+  af_test::build_running_fixture(af_ctx, fixture, 2);
+  const CandidateId produced =
+      af_test::drive_full_candidate(af_ctx, fixture, 1, af_test::FullEvidence{});
+
+  af_ctx.phase("DISPATCH");
+  REQUIRE_VALUE(af_ctx, SelectionDecision, prepared,
+                fixture.core.prepare_selection(fixture.population));
+  EXPECT_EQ(af_ctx, prepared.selected, produced);
+
+  // The coordinator restarts: the decision above was prepared under the previous
+  // epoch and recovery discarded it.
+  af_test::FoundryFixture restarted(af_test::make_config(61));
+  REQUIRE_OK(af_ctx, restarted.core.recover(fixture.core.snapshot()));
+  const FoundrySnapshot before = restarted.core.snapshot();
+
+  af_ctx.phase("COMMIT");
+  const Result<SelectionDecision> stale = restarted.core.commit_selection(prepared);
+  EXPECT_FALSE(af_ctx, stale.ok());
+
+  af_ctx.phase("VERIFY");
+  const CandidateRecord winner = af_test::load_candidate(af_ctx, restarted.core, produced);
+  EXPECT_FALSE(af_ctx, winner.selected);
+  EXPECT_EQ(af_ctx, winner.state, CandidateState::Evaluated);
+  REQUIRE_VALUE(af_ctx, PopulationRecord, population,
+                restarted.core.population(fixture.population));
+  EXPECT_FALSE(af_ctx, population.committed_selection.valid());
+  EXPECT_EQ(af_ctx, population.state, PopulationState::RevalidationRequired);
+  EXPECT_NOT_OK(af_ctx, restarted.core.selection(fixture.population));
+  EXPECT_EQ(af_ctx, restarted.core.revision(), before.revision);
+  EXPECT_TRUE(af_ctx, restarted.core.audit().empty());
+}
+
+AF_TEST_CASE(adversarial, refused_cancellation_leaves_no_trace) {
+  af_ctx.phase("SETUP");
+  af_test::FoundryFixture fixture(af_test::make_config(62));
+  af_test::build_running_fixture(af_ctx, fixture, 2);
+  const WorkerSessionAuthority first = af_test::connect_worker(af_ctx, fixture.core, 1);
+  const WorkerSessionAuthority second = af_test::connect_worker(af_ctx, fixture.core, 2);
+
+  af_ctx.phase("DISPATCH");
+  // Both attempts are authorized while the population is Running; only the
+  // first one publishes, so the second is still in flight when selection commits.
+  const PreparedAttempt winner_attempt = prepare_attempt(af_ctx, fixture.core, first);
+  const PreparedAttempt open_attempt = prepare_attempt(af_ctx, fixture.core, second);
+  REQUIRE_VALUE(af_ctx, PublicationOutcome, published,
+                fixture.core.publish_candidate(
+                    winner_attempt.authority,
+                    solution_artifacts(af_test::reference_solution_source(0)), "strategy-1"));
+  REQUIRE_OK(af_ctx, fixture.core.begin_evaluation(published.candidate));
+  record_full_evidence(af_ctx, fixture.core,
+                       af_test::load_candidate(af_ctx, fixture.core, published.candidate));
+
+  af_ctx.phase("COMMIT");
+  REQUIRE_VALUE(af_ctx, SelectionDecision, prepared,
+                fixture.core.prepare_selection(fixture.population));
+  REQUIRE_VALUE(af_ctx, SelectionDecision, committed, fixture.core.commit_selection(prepared));
+  EXPECT_EQ(af_ctx, committed.selected, published.candidate);
+  REQUIRE_VALUE(af_ctx, PopulationRecord, advancing, fixture.core.population(fixture.population));
+  EXPECT_EQ(af_ctx, advancing.state, PopulationState::Advancing);
+  const std::uint64_t revision_before = fixture.core.revision();
+
+  // A population whose selection is committed has no edge to Cancelled, so the
+  // cancellation is refused - and a refused cancellation cancels nothing.
+  EXPECT_STATUS_CODE(af_ctx,
+                     fixture.core.cancel_population(fixture.population, advancing.generation,
+                                                    "operator cancel"),
+                     ErrorCode::IllegalStateTransition);
+
+  af_ctx.phase("VERIFY");
+  REQUIRE_VALUE(af_ctx, AttemptRecord, still_open,
+                fixture.core.attempt(open_attempt.authority.attempt));
+  EXPECT_EQ(af_ctx, still_open.state, AttemptState::Running);
+  const CandidateRecord open_candidate =
+      af_test::load_candidate(af_ctx, fixture.core, open_attempt.authority.candidate);
+  EXPECT_EQ(af_ctx, open_candidate.state, CandidateState::Producing);
+  EXPECT_EQ(af_ctx, fixture.core.revision(), revision_before);
+  EXPECT_EQ(af_ctx, fixture.core.statistics().attempts_cancelled, static_cast<std::uint64_t>(0));
+}
+
+AF_TEST_CASE(adversarial, terminal_or_unrevalidated_population_decides_nothing_further) {
+  af_ctx.phase("SETUP");
+  af_test::FoundryFixture fixture(af_test::make_config(63));
+  af_test::build_running_fixture(af_ctx, fixture, 1);
+  (void)af_test::drive_full_candidate(af_ctx, fixture, 1, af_test::FullEvidence{});
+
+  af_ctx.phase("COMMIT");
+  REQUIRE_VALUE(af_ctx, SelectionDecision, prepared,
+                fixture.core.prepare_selection(fixture.population));
+  REQUIRE_VALUE(af_ctx, SelectionDecision, committed, fixture.core.commit_selection(prepared));
+  EXPECT_TRUE(af_ctx, committed.selected.valid());
+  REQUIRE_VALUE(af_ctx, RetentionDecision, retention,
+                fixture.core.prepare_retention(fixture.population));
+  REQUIRE_VALUE(af_ctx, RetentionDecision, retained, fixture.core.commit_retention(retention));
+  EXPECT_TRUE(af_ctx, retained.committed);
+
+  af_ctx.phase("RECOVERY");
+  // After a restart the committed decisions are still there, but the population
+  // emits nothing until it has been revalidated.
+  {
+    af_test::FoundryFixture restarted(af_test::make_config(63));
+    REQUIRE_OK(af_ctx, restarted.core.recover(fixture.core.snapshot()));
+    EXPECT_STATUS_CODE(af_ctx, restarted.core.prepare_promotion_request(fixture.population),
+                       ErrorCode::RevalidationRequired);
+    EXPECT_EQ(af_ctx, restarted.core.statistics().promotion_requests,
+              static_cast<std::uint64_t>(0));
+  }
+
+  af_ctx.phase("DISPATCH");
+  // The population is sent back for revalidation and cancelled from there.
+  REQUIRE_OK(af_ctx, fixture.core.request_population_revalidation(fixture.population,
+                                                                  "operator review"));
+  REQUIRE_VALUE(af_ctx, PopulationRecord, pending, fixture.core.population(fixture.population));
+  REQUIRE_OK(af_ctx, fixture.core.cancel_population(fixture.population, pending.generation,
+                                                    "operator cancel"));
+
+  af_ctx.phase("VERIFY");
+  // Cancellation is final: no promotion request and no new retention decision.
+  EXPECT_STATUS_CODE(af_ctx, fixture.core.prepare_promotion_request(fixture.population),
+                     ErrorCode::LateCompletion);
+  REQUIRE_VALUE(af_ctx, PopulationRecord, cancelled, fixture.core.population(fixture.population));
+  EXPECT_EQ(af_ctx, cancelled.state, PopulationState::Cancelled);
+  EXPECT_FALSE(af_ctx, cancelled.committed_promotion_request.valid());
+  EXPECT_EQ(af_ctx, fixture.core.statistics().promotion_requests, static_cast<std::uint64_t>(0));
+  RetentionDecision replay = retained;
+  replay.population_generation = cancelled.generation;
+  EXPECT_STATUS_CODE(af_ctx, fixture.core.commit_retention(replay), ErrorCode::LateCompletion);
+}
+
+AF_TEST_CASE(adversarial, a_prepared_round_does_not_replace_the_committed_selection) {
+  af_ctx.phase("SETUP");
+  af_test::FoundryFixture fixture(af_test::make_config(66));
+  af_test::build_running_fixture(af_ctx, fixture, 1);
+  const CandidateId produced =
+      af_test::drive_full_candidate(af_ctx, fixture, 1, af_test::FullEvidence{});
+
+  af_ctx.phase("COMMIT");
+  REQUIRE_VALUE(af_ctx, SelectionDecision, prepared,
+                fixture.core.prepare_selection(fixture.population));
+  REQUIRE_VALUE(af_ctx, SelectionDecision, committed, fixture.core.commit_selection(prepared));
+
+  af_ctx.phase("DISPATCH");
+  // A second round is prepared and never committed.
+  REQUIRE_VALUE(af_ctx, SelectionDecision, second,
+                fixture.core.prepare_selection(fixture.population));
+  EXPECT_EQ(af_ctx, second.state, SelectionDecisionState::Prepared);
+  EXPECT_EQ(af_ctx, second.selected, produced);
+
+  af_ctx.phase("VERIFY");
+  // The committed decision is still the population's decision of record ...
+  REQUIRE_VALUE(af_ctx, SelectionDecision, stored, fixture.core.selection(fixture.population));
+  EXPECT_EQ(af_ctx, stored.state, SelectionDecisionState::Committed);
+  EXPECT_EQ(af_ctx, stored.generation, committed.generation);
+  // ... so retention can still be decided from it ...
+  REQUIRE_VALUE(af_ctx, RetentionDecision, retention,
+                fixture.core.prepare_retention(fixture.population));
+  EXPECT_EQ(af_ctx, retention.selection_generation, committed.generation);
+  // ... and a restart does not find a committed selection without its record.
+  af_test::FoundryFixture restarted(af_test::make_config(66));
+  REQUIRE_OK(af_ctx, restarted.core.recover(fixture.core.snapshot()));
+  REQUIRE_VALUE(af_ctx, PopulationRecord, recovered,
+                restarted.core.population(fixture.population));
+  EXPECT_EQ(af_ctx, recovered.committed_selection, committed.generation);
+  EXPECT_OK(af_ctx, restarted.core.selection(fixture.population));
+}
+
+AF_TEST_CASE(adversarial, published_attempt_outlives_its_worker_and_is_counted_complete) {
+  af_ctx.phase("SETUP");
+  af_test::FoundryFixture fixture(af_test::make_config(64));
+  af_test::build_running_fixture(af_ctx, fixture, 2);
+  const WorkerSessionAuthority session = af_test::connect_worker(af_ctx, fixture.core, 1);
+
+  af_ctx.phase("DISPATCH");
+  const CandidateId produced = af_test::produce_candidate(
+      af_ctx, fixture.core, session, af_test::reference_solution_source(0), "strategy-1");
+  const CandidateRecord published = af_test::load_candidate(af_ctx, fixture.core, produced);
+  const AttemptId attempt = published.attempt;
+  const FoundryStatistics before = fixture.core.statistics();
+
+  // The worker leaves after its result was committed. That result is not in
+  // flight: nothing about it is unknown.
+  REQUIRE_OK(af_ctx, fixture.core.worker_disconnected(session, "connection closed"));
+
+  af_ctx.phase("VERIFY");
+  REQUIRE_VALUE(af_ctx, AttemptRecord, after_disconnect, fixture.core.attempt(attempt));
+  EXPECT_EQ(af_ctx, after_disconnect.state, AttemptState::Published);
+  EXPECT_EQ(af_ctx, fixture.core.statistics().attempts_outcome_unknown,
+            before.attempts_outcome_unknown);
+
+  // A new incarnation of the same worker does not rewrite that history either.
+  WorkerRegistrationRequest reincarnated;
+  reincarnated.worker = af_test::worker_identity(1);
+  reincarnated.boot = af_test::boot_identity(9);
+  reincarnated.label = "worker";
+  reincarnated.capability = "reference";
+  REQUIRE_VALUE(af_ctx, WorkerSessionAuthority, fresh, fixture.core.register_worker(reincarnated));
+  EXPECT_TRUE(af_ctx, fresh.session.valid());
+  REQUIRE_VALUE(af_ctx, AttemptRecord, after_replacement, fixture.core.attempt(attempt));
+  EXPECT_EQ(af_ctx, after_replacement.state, AttemptState::Published);
+
+  // Evaluation completes the attempt without the worker, and the completion is
+  // counted.
+  REQUIRE_OK(af_ctx, fixture.core.begin_evaluation(produced));
+  record_full_evidence(af_ctx, fixture.core, published);
+  REQUIRE_VALUE(af_ctx, AttemptRecord, completed, fixture.core.attempt(attempt));
+  EXPECT_EQ(af_ctx, completed.state, AttemptState::Completed);
+  const FoundryStatistics after = fixture.core.statistics();
+  EXPECT_EQ(af_ctx, after.attempts_completed, before.attempts_completed + 1);
+  EXPECT_EQ(af_ctx, after.attempts_outcome_unknown, before.attempts_outcome_unknown);
+  EXPECT_EQ(af_ctx, af_test::load_candidate(af_ctx, fixture.core, produced).state,
+            CandidateState::Evaluated);
+}
+
+AF_TEST_CASE(adversarial, snapshot_equality_compares_ledgers_in_both_directions) {
+  af_ctx.phase("SETUP");
+  af_test::FoundryFixture fixture(af_test::make_config(65));
+  af_test::build_running_fixture(af_ctx, fixture, 1);
+  const FoundrySnapshot complete = fixture.core.snapshot();
+  EXPECT_EQ(af_ctx, complete.ledgers.size(), static_cast<std::size_t>(1));
+  FoundrySnapshot without_ledger = complete;
+  without_ledger.ledgers.clear();
+
+  af_ctx.phase("VERIFY");
+  EXPECT_TRUE(af_ctx, snapshots_are_equal(complete, complete));
+  // A ledger present on one side only is a difference, whichever side it is on.
+  EXPECT_FALSE(af_ctx, snapshots_are_equal(without_ledger, complete));
+  EXPECT_FALSE(af_ctx, snapshots_are_equal(complete, without_ledger));
+}

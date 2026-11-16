@@ -162,11 +162,27 @@ AF_TEST_CASE(distributed_proof, tcp_pipeline_commits_a_winner_and_a_retention_th
 
   const WorkerId first_worker = worker_identity(0x41u, 1u);
   const WorkerId second_worker = worker_identity(0x41u, 2u);
+  Result<StatisticsDetailMessage> before_workers = query_statistics(af_ctx, controller);
+  AF_DIST_REQUIRE_OK(af_ctx, before_workers);
   ChildProcess workers[2];
   AF_DIST_REQUIRE_OK(af_ctx, spawn_worker(workers[0], worker_exe, port.value(), first_worker,
                                           workspace, "closed-form", "worker-closed-form"));
   AF_DIST_REQUIRE_OK(af_ctx, spawn_worker(workers[1], worker_exe, port.value(), second_worker,
                                           workspace, "iterative", "worker-iterative"));
+
+  // Production is dispatched only while the population is Running, and the
+  // first publication takes it to Evaluating. A worker that became Ready after
+  // that would never receive an assignment, so the population is started only
+  // once both workers are Ready. Nothing else changes foundry state between
+  // creating the population and starting it: each worker's registration and its
+  // readiness report advance the revision once, four steps in all.
+  await_true(af_ctx, "CONNECT", [&] {
+    require_running(af_ctx, coordinator, "the coordinator");
+    require_running(af_ctx, workers[0], "the first worker");
+    require_running(af_ctx, workers[1], "the second worker");
+    const Result<StatisticsDetailMessage> observed = query_statistics(af_ctx, controller);
+    return observed.ok() && observed.value().revision >= before_workers.value().revision + 4u;
+  });
 
   af_ctx.phase("DISPATCH");
   Result<PopulationStateMessage> started = start_population(af_ctx, controller, binding);

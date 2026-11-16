@@ -72,6 +72,11 @@ Result<WorkerSessionAuthority> FoundryCore::register_worker(
       if (attempt.worker != request.worker || attempt_state_is_terminal(attempt.state)) {
         continue;
       }
+      // A result that was already published and committed is not in flight: its
+      // outcome is known, and evaluation completes it without the worker.
+      if (attempt.state == AttemptState::Published || attempt.state == AttemptState::Evaluating) {
+        continue;
+      }
       impl_->release_attempt_reservations_locked(attempt);
       AF_TRY(impl_->set_attempt_state_locked(
           attempt, AttemptState::OutcomeUnknown,
@@ -205,6 +210,11 @@ Status FoundryCore::worker_disconnected(const WorkerSessionAuthority& session,
       continue;
     }
     if (attempt_state_is_terminal(attempt.state)) {
+      continue;
+    }
+    // A result that was already published and committed is not in flight: its
+    // outcome is known, and evaluation completes it without the worker.
+    if (attempt.state == AttemptState::Published || attempt.state == AttemptState::Evaluating) {
       continue;
     }
     // The worker is gone. Whether the work completed is unknowable from here,

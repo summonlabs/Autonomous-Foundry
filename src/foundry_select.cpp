@@ -195,6 +195,19 @@ std::string compute_retention_state_digest(const PopulationRecord& population,
 // Selection
 // ---------------------------------------------------------------------------
 
+void FoundryCore::Impl::store_prepared_selection_locked(const SelectionDecision& decision) {
+  // One decision is kept per population. A committed decision is the durable
+  // record the population's committed selection generation refers to, and
+  // retention, promotion and evolution all read it; a later round that is only
+  // prepared must not replace it. The prepared decision is still returned to the
+  // caller, and committing it revalidates it against current state.
+  const auto stored = selections_.find(decision.population);
+  if (stored != selections_.end() && stored->second.state == SelectionDecisionState::Committed) {
+    return;
+  }
+  selections_[decision.population] = decision;
+}
+
 Result<SelectionDecision> FoundryCore::prepare_selection(PopulationId id) {
   std::unique_lock lock(impl_->mutex);
 
@@ -411,7 +424,7 @@ Result<SelectionDecision> FoundryCore::prepare_selection(PopulationId id) {
         "no candidate satisfied every mandatory gate; ranking was not entered";
     decision.canonical_state_digest = compute_selection_state_digest(
         *population, *task, *policy, canonical.candidates, canonical.evaluations);
-    impl_->selections_[population->id] = decision;
+    impl_->store_prepared_selection_locked(decision);
     impl_->statistics_.selections_prepared += 1;
     AF_TRY(impl_->set_population_state_locked(*population, PopulationState::Selecting,
                                               "selection prepared with no eligible candidate"));
@@ -491,7 +504,7 @@ Result<SelectionDecision> FoundryCore::prepare_selection(PopulationId id) {
                        " excluded candidate(s); winner " + decision.selected.to_string() +
                        " with total score " + canonical_double(ranking.front().total_score);
 
-  impl_->selections_[population->id] = decision;
+  impl_->store_prepared_selection_locked(decision);
   impl_->statistics_.selections_prepared += 1;
   AF_TRY(impl_->set_population_state_locked(*population, PopulationState::Selecting,
                                             "selection prepared"));
@@ -526,6 +539,49 @@ Result<SelectionDecision> FoundryCore::commit_selection(const SelectionDecision&
   const std::string current_digest = compute_selection_state_digest(
       *population, *task, *policy, canonical.candidates, canonical.evaluations);
   AF_TRY(check_canonical_digest(prepared.canonical_state_digest, current_digest));
+
+  // Everything that can refuse the commit is decided before anything changes,
+  // so a refused commit leaves no trace. A decision prepared under a previous
+  // coordinator epoch was discarded by recovery and is not authority any more.
+  AF_TRY(check_coordinator_epoch(prepared.coordinator_epoch, impl_->epoch_));
+  if (population->state == PopulationState::RevalidationRequired) {
+    return Status(ErrorCode::RevalidationRequired,
+                  "population " + population->id.to_string() +
+                      " requires revalidation before it may commit a selection");
+  }
+  if (!population_transition_is_legal(population->state, PopulationState::Advancing)) {
+    return Status(ErrorCode::IllegalStateTransition,
+                  "population " + population->id.to_string() + " is " +
+                      std::string(population_state_name(population->state)) +
+                      " and cannot commit a selection");
+  }
+  if (prepared.selected.valid()) {
+    const CandidateRecord* winner = impl_->candidate_locked(prepared.selected);
+    if (winner == nullptr) {
+      return Status(ErrorCode::UnknownIdentity, "selected candidate is missing from state");
+    }
+    bool gates_complete = true;
+    for (const EvaluationRequirement& requirement : task->requirements) {
+      if (requirement.requirement_class == RequirementClass::Mandatory &&
+          !impl_->requirement_complete_locked(*winner, requirement.evaluator_key)) {
+        gates_complete = false;
+        break;
+      }
+    }
+    CandidateState reached = winner->state;
+    if (gates_complete && reached == CandidateState::Published) {
+      reached = CandidateState::Evaluating;
+    }
+    if (gates_complete && reached == CandidateState::Evaluating) {
+      reached = CandidateState::Evaluated;
+    }
+    if (!candidate_transition_is_legal(reached, CandidateState::Selected)) {
+      return Status(ErrorCode::IllegalStateTransition,
+                    "candidate " + winner->id.to_string() + " is " +
+                        std::string(candidate_state_name(winner->state)) +
+                        " and cannot be committed as the selected winner");
+    }
+  }
 
   SelectionDecision committed = prepared;
   committed.state = SelectionDecisionState::Committed;
@@ -626,6 +682,16 @@ Result<RetentionDecision> FoundryCore::prepare_retention(PopulationId id) {
         stored->second.selection_generation == population->committed_selection) {
       return stored->second;
     }
+  }
+
+  // A population that has left the live lifecycle, or that has not been
+  // revalidated since the coordinator restarted, makes no new decision.
+  AF_TRY(impl_->require_live_population_authority_locked(*population,
+                                                         "prepare a retention decision"));
+  if (population->state == PopulationState::RevalidationRequired) {
+    return Status(ErrorCode::RevalidationRequired,
+                  "population " + id.to_string() +
+                      " requires revalidation before it may decide retention");
   }
 
   const FoundryPolicy* policy = impl_->policy_locked(population->policy);
@@ -790,6 +856,13 @@ Result<RetentionDecision> FoundryCore::commit_retention(const RetentionDecision&
   }
   AF_TRY(check_population_generation(prepared.population_generation, population->generation));
   AF_TRY(check_policy_generation(prepared.policy_generation, population->policy_generation));
+  AF_TRY(impl_->require_live_population_authority_locked(*population,
+                                                         "commit a retention decision"));
+  if (population->state == PopulationState::RevalidationRequired) {
+    return Status(ErrorCode::RevalidationRequired,
+                  "population " + population->id.to_string() +
+                      " requires revalidation before it may commit retention");
+  }
   if (population->committed_selection != prepared.selection_generation) {
     return Status(ErrorCode::StaleSelection,
                   "retention names selection generation " +
@@ -856,6 +929,15 @@ Result<PromotionRequest> FoundryCore::prepare_promotion_request(PopulationId id)
   PopulationRecord* population = impl_->population_locked(id);
   if (population == nullptr) {
     return Status(ErrorCode::UnknownIdentity, "population " + id.to_string() + " does not exist");
+  }
+  // A cancelled, failed or closed population emits no further handoff request,
+  // and neither does one that still awaits revalidation.
+  AF_TRY(impl_->require_live_population_authority_locked(*population,
+                                                         "prepare a promotion request"));
+  if (population->state == PopulationState::RevalidationRequired) {
+    return Status(ErrorCode::RevalidationRequired,
+                  "population " + id.to_string() +
+                      " requires revalidation before it may request promotion");
   }
   if (!population->committed_selection.valid() || !population->retention_committed) {
     return Status(ErrorCode::PromotionNotEligible,
